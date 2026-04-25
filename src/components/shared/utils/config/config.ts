@@ -12,6 +12,9 @@ export const APP_IDS = {
     PRODUCTION_ME: 65557,
 };
 
+// App client_id for OAuth2/OIDC and WebSocket connections
+export const APP_CLIENT_ID = '335G35zPoJOjUXJkl0LlQ';
+
 export const livechat_license_id = 12049137;
 export const livechat_client_id = '66aa088aad5a414484c1fd1fa8a5ace7';
 
