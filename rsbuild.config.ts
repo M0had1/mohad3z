@@ -1,24 +1,27 @@
 import { defineConfig } from '@rsbuild/core';
 import { pluginReact } from '@rsbuild/plugin-react';
 import { pluginSass } from '@rsbuild/plugin-sass';
-import { pluginBasicSsl } from '@rsbuild/plugin-basic-ssl';
 
 const path = require('path');
+
+// Determine if we're running in a Netlify/CI environment (no HTTPS needed)
+const isCI = process.env.CI === 'true' || process.env.NETLIFY === 'true';
+
+// Helper: return env var or empty string fallback (prevents build crashes for missing secrets)
+const env = (key: string, fallback = '') => process.env[key] || fallback;
 
 export default defineConfig({
     plugins: [
         pluginSass({
             sassLoaderOptions: {
-                sourceMap: true,
-                sassOptions: {
-                    // includePaths: [path.resolve(__dirname, 'src')],
-                },
-                // additionalData: `@use "${path.resolve(__dirname, 'src/components/shared/styles')}" as *;`,
+                sourceMap: !isCI,
+                sassOptions: {},
             },
             exclude: /node_modules/,
         }),
         pluginReact(),
-        pluginBasicSsl(),
+        // Only use SSL plugin in local dev — Netlify handles TLS itself
+        ...(isCI ? [] : [require('@rsbuild/plugin-basic-ssl').pluginBasicSsl()]),
     ],
     source: {
         entry: {
@@ -26,23 +29,37 @@ export default defineConfig({
         },
         define: {
             'process.env': {
-                TRANSLATIONS_CDN_URL: JSON.stringify(process.env.TRANSLATIONS_CDN_URL),
-                R2_PROJECT_NAME: JSON.stringify(process.env.R2_PROJECT_NAME),
-                CROWDIN_BRANCH_NAME: JSON.stringify(process.env.CROWDIN_BRANCH_NAME),
-                TRACKJS_TOKEN: JSON.stringify(process.env.TRACKJS_TOKEN),
-                APP_ENV: JSON.stringify(process.env.APP_ENV),
-                REF_NAME: JSON.stringify(process.env.REF_NAME),
-                REMOTE_CONFIG_URL: JSON.stringify(process.env.REMOTE_CONFIG_URL),
-                GD_CLIENT_ID: JSON.stringify(process.env.GD_CLIENT_ID),
-                GD_APP_ID: JSON.stringify(process.env.GD_APP_ID),
-                GD_API_KEY: JSON.stringify(process.env.GD_API_KEY),
-                DATADOG_SESSION_REPLAY_SAMPLE_RATE: JSON.stringify(process.env.DATADOG_SESSION_REPLAY_SAMPLE_RATE),
-                DATADOG_SESSION_SAMPLE_RATE: JSON.stringify(process.env.DATADOG_SESSION_SAMPLE_RATE),
-                DATADOG_APPLICATION_ID: JSON.stringify(process.env.DATADOG_APPLICATION_ID),
-                DATADOG_CLIENT_TOKEN: JSON.stringify(process.env.DATADOG_CLIENT_TOKEN),
-                RUDDERSTACK_KEY: JSON.stringify(process.env.RUDDERSTACK_KEY),
-                GROWTHBOOK_CLIENT_KEY: JSON.stringify(process.env.GROWTHBOOK_CLIENT_KEY),
-                GROWTHBOOK_DECRYPTION_KEY: JSON.stringify(process.env.GROWTHBOOK_DECRYPTION_KEY),
+                // Core build vars
+                APP_ENV: JSON.stringify(env('APP_ENV', 'production')),
+                REF_NAME: JSON.stringify(env('REF_NAME', 'main')),
+                NETLIFY: JSON.stringify(env('NETLIFY', '')),
+
+                // Translations CDN — falls back to Deriv's public CDN if not set
+                TRANSLATIONS_CDN_URL: JSON.stringify(env('TRANSLATIONS_CDN_URL', 'https://cdn.deriv.com')),
+                R2_PROJECT_NAME: JSON.stringify(env('R2_PROJECT_NAME', 'bot')),
+                CROWDIN_BRANCH_NAME: JSON.stringify(env('CROWDIN_BRANCH_NAME', 'production')),
+
+                // Remote config
+                REMOTE_CONFIG_URL: JSON.stringify(env('REMOTE_CONFIG_URL', '')),
+
+                // Google Drive integration — optional, safe to leave empty
+                GD_CLIENT_ID: JSON.stringify(env('GD_CLIENT_ID', '')),
+                GD_APP_ID: JSON.stringify(env('GD_APP_ID', '')),
+                GD_API_KEY: JSON.stringify(env('GD_API_KEY', '')),
+
+                // Error monitoring — optional, disabled when empty
+                TRACKJS_TOKEN: JSON.stringify(env('TRACKJS_TOKEN', '')),
+                DATADOG_APPLICATION_ID: JSON.stringify(env('DATADOG_APPLICATION_ID', '')),
+                DATADOG_CLIENT_TOKEN: JSON.stringify(env('DATADOG_CLIENT_TOKEN', '')),
+                DATADOG_SESSION_REPLAY_SAMPLE_RATE: JSON.stringify(env('DATADOG_SESSION_REPLAY_SAMPLE_RATE', '0')),
+                DATADOG_SESSION_SAMPLE_RATE: JSON.stringify(env('DATADOG_SESSION_SAMPLE_RATE', '0')),
+
+                // Analytics — optional, disabled when empty
+                RUDDERSTACK_KEY: JSON.stringify(env('RUDDERSTACK_KEY', '')),
+
+                // Feature flags — optional, disabled when empty
+                GROWTHBOOK_CLIENT_KEY: JSON.stringify(env('GROWTHBOOK_CLIENT_KEY', '')),
+                GROWTHBOOK_DECRYPTION_KEY: JSON.stringify(env('GROWTHBOOK_DECRYPTION_KEY', '')),
             },
         },
         alias: {
@@ -87,6 +104,8 @@ export default defineConfig({
     server: {
         port: 8443,
         compress: true,
+        // Use plain HTTP in CI/Netlify; HTTPS locally via pluginBasicSsl
+        https: isCI ? false : undefined,
         headers: {
             'Cross-Origin-Opener-Policy': 'unsafe-none',
             'Cross-Origin-Embedder-Policy': 'unsafe-none',

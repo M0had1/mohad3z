@@ -3,11 +3,12 @@
     "private": true,
     "version": "0.0.1",
     "engines": {
-        "node": "20.x"
+        "node": ">=20.0.0"
     },
     "scripts": {
         "start": "rsbuild dev -o",
         "build": "rsbuild build",
+        "build:netlify": "CI=true NETLIFY=true rsbuild build",
         "watch": "rsbuild build --watch",
         "serve": "http-server dist -p 8443 -a localhost -o",
         "start:webpack": "webpack serve --open --config webpack.config.js",

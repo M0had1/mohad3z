@@ -1,0 +1,74 @@
+name: Build and Deploy to Netlify
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+    branches:
+      - master
+      - main
+
+concurrency:
+  group: netlify-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_and_deploy:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Build
+        env:
+          CI: true
+          NETLIFY: true
+          APP_ENV: production
+          CROWDIN_BRANCH_NAME: production
+          # Optional secrets — add these in your GitHub repo settings if you have them
+          TRANSLATIONS_CDN_URL: ${{ vars.TRANSLATIONS_CDN_URL || 'https://cdn.deriv.com' }}
+          R2_PROJECT_NAME: ${{ vars.R2_PROJECT_NAME || 'bot' }}
+          RUDDERSTACK_KEY: ${{ vars.RUDDERSTACK_KEY }}
+          REMOTE_CONFIG_URL: ${{ vars.REMOTE_CONFIG_URL }}
+          GROWTHBOOK_CLIENT_KEY: ${{ vars.GROWTHBOOK_CLIENT_KEY }}
+          GROWTHBOOK_DECRYPTION_KEY: ${{ vars.GROWTHBOOK_DECRYPTION_KEY }}
+          GD_API_KEY: ${{ secrets.GD_API_KEY }}
+          GD_APP_ID: ${{ secrets.GD_APP_ID }}
+          GD_CLIENT_ID: ${{ secrets.GD_CLIENT_ID }}
+          TRACKJS_TOKEN: ${{ secrets.TRACKJS_TOKEN }}
+          DATADOG_APPLICATION_ID: ${{ secrets.DATADOG_APPLICATION_ID }}
+          DATADOG_CLIENT_TOKEN: ${{ secrets.DATADOG_CLIENT_TOKEN }}
+        run: npm run build
+
+      - name: Deploy to Netlify (Production — master/main)
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+        uses: netlify/actions/cli@master
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        with:
+          args: deploy --dir=dist --prod
+
+      - name: Deploy to Netlify (Preview — PR)
+        if: github.event_name == 'pull_request'
+        uses: netlify/actions/cli@master
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        with:
+          args: deploy --dir=dist
