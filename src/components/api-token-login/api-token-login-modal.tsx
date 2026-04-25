@@ -1,8 +1,46 @@
 import React, { useCallback, useState } from 'react';
-import { generateDerivApiInstance } from '@/external/bot-skeleton/services/api/appId';
+import { getAppId } from '@/components/shared';
+import { getInitialLanguage } from '@deriv-com/translations';
+import DerivAPIBasic from '@deriv/deriv-api/dist/DerivAPIBasic';
 import { LegacyClose1pxIcon } from '@deriv/quill-icons/Legacy';
 import { Localize, useTranslations } from '@deriv-com/translations';
 import './api-token-login-modal.scss';
+
+// ─── helpers ────────────────────────────────────────────────────────────────
+
+/** Is this loginid a demo/virtual account? */
+const isDemoLoginid = (loginid: string) => /^(VRT|VRW)/i.test(loginid);
+
+/**
+ * Open a DerivAPIBasic socket to a specific server and wait for it to be ready.
+ * Returns the api instance. Rejects on timeout or socket error.
+ */
+const openSocket = (server: string): Promise<InstanceType<typeof DerivAPIBasic>> => {
+    return new Promise((resolve, reject) => {
+        const appId = getAppId();
+        const lang = getInitialLanguage();
+        const url = `wss://${server}/websockets/v3?app_id=${appId}&l=${lang}&brand=deriv`;
+        const ws = new WebSocket(url);
+        const api = new DerivAPIBasic({ connection: ws });
+        const timeout = setTimeout(() => {
+            try { ws.close(); } catch (_) { /* ignore */ }
+            reject(new Error('Connection timeout'));
+        }, 12000);
+        ws.addEventListener('open', () => {
+            clearTimeout(timeout);
+            resolve(api);
+        });
+        ws.addEventListener('error', () => {
+            clearTimeout(timeout);
+            reject(new Error('WebSocket connection failed'));
+        });
+    });
+};
+
+/** Safely disconnect an api instance without throwing. */
+const safeDisconnect = (api: InstanceType<typeof DerivAPIBasic> | null) => {
+    try { (api as any)?.disconnect?.(); } catch (_) { /* ignore */ }
+};
 
 type TApiTokenLoginModalProps = {
     is_open: boolean;
@@ -39,72 +77,91 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
         setState('loading');
         setErrorMessage('');
 
-        let api: ReturnType<typeof generateDerivApiInstance> | null = null;
+        // Phase-1 api (blue/demo server — safe neutral entry point)
+        let api1: InstanceType<typeof DerivAPIBasic> | null = null;
+        // Phase-2 api (correct server once we know real vs demo)
+        let api2: InstanceType<typeof DerivAPIBasic> | null = null;
+
+        type AuthorizeAccount = {
+            loginid: string;
+            token?: string;
+            currency?: string;
+            is_virtual?: number;
+            landing_company_name?: string;
+        };
+
+        type AuthorizeResponse = {
+            authorize: {
+                loginid: string;
+                currency: string;
+                balance: number;
+                email: string;
+                country: string;
+                account_list: AuthorizeAccount[];
+            };
+            error?: { message: string; code: string };
+        };
 
         try {
-            api = generateDerivApiInstance();
+            // ── Phase 1: connect to blue (neutral) to discover the loginid ───────
+            // blue.derivws.com serves both real and demo accounts for auth purposes.
+            // We need the loginid first to know which server to use for the app.
+            api1 = await openSocket('blue.derivws.com');
 
-            // Wait for WebSocket to open
-            await new Promise<void>((resolve, reject) => {
-                const timeout = setTimeout(() => reject(new Error('Connection timeout')), 10000);
-                if ((api as any)?.connection?.readyState === 1) {
-                    clearTimeout(timeout);
-                    resolve();
-                } else {
-                    (api as any)?.connection?.addEventListener('open', () => {
-                        clearTimeout(timeout);
-                        resolve();
-                    });
-                    (api as any)?.connection?.addEventListener('error', () => {
-                        clearTimeout(timeout);
-                        reject(new Error('WebSocket connection failed'));
-                    });
-                }
-            });
+            const phase1 = (await (api1 as any).authorize(trimmed)) as AuthorizeResponse;
 
-            const { authorize, error } = (await (api as any).authorize(trimmed)) as {
-                authorize: {
-                    loginid: string;
-                    token: string;
-                    currency: string;
-                    balance: number;
-                    email: string;
-                    account_list: Array<{ loginid: string; token: string; currency: string; is_virtual: number }>;
-                };
-                error?: { message: string; code: string };
-            };
-
-            if (error) {
-                let friendly_error = localize('Authentication failed. Please check your token and try again.');
-                if (error.code === 'InvalidToken') {
-                    friendly_error = localize('Invalid API token. Please make sure you copied it correctly.');
-                } else if (error.code === 'DisabledClient') {
-                    friendly_error = localize('This account has been disabled. Please contact support.');
-                } else if (error.message) {
-                    friendly_error = error.message;
-                }
-                setErrorMessage(friendly_error);
+            if (phase1.error) {
+                const e = phase1.error;
+                let msg = localize('Authentication failed. Please check your token and try again.');
+                if (e.code === 'InvalidToken') msg = localize('Invalid API token. Please make sure you copied it correctly.');
+                else if (e.code === 'DisabledClient') msg = localize('This account has been disabled. Please contact support.');
+                else if (e.message) msg = e.message;
+                setErrorMessage(msg);
                 setState('error');
+                safeDisconnect(api1);
                 return;
             }
 
-            // Build account structures exactly as OAuth flow does
+            const { loginid, currency, country, account_list } = phase1.authorize;
+            const isDemo = isDemoLoginid(loginid);
+
+            // ── Phase 2: open the CORRECT server socket ───────────────────────────
+            // Real accounts must use green.derivws.com — this is what the app
+            // uses after login and what balance subscriptions run against.
+            // Demo accounts use blue.derivws.com.
+            // getDefaultServerURL() in config.ts does the same check.
+            safeDisconnect(api1);
+            api1 = null;
+
+            const targetServer = isDemo ? 'blue.derivws.com' : 'green.derivws.com';
+            api2 = await openSocket(targetServer);
+
+            const phase2 = (await (api2 as any).authorize(trimmed)) as AuthorizeResponse;
+
+            if (phase2.error) {
+                const e = phase2.error;
+                let msg = localize('Authentication failed. Please try again.');
+                if (e.message) msg = e.message;
+                setErrorMessage(msg);
+                setState('error');
+                safeDisconnect(api2);
+                return;
+            }
+
+            // ── Build localStorage structures ──────────────────────────────────
+            // Must exactly mirror what AuthWrapper.setLocalStorageToken() writes
+            // so that api-base.ts → authorizeAndSubscribe() picks everything up.
             const accountsList: Record<string, string> = {};
             const clientAccounts: Record<string, { loginid: string; token: string; currency: string }> = {};
 
-            // Primary account from authorize response
-            const loginid = authorize.loginid;
+            // Primary account — always use the provided token
             accountsList[loginid] = trimmed;
-            clientAccounts[loginid] = {
-                loginid,
-                token: trimmed,
-                currency: authorize.currency ?? 'USD',
-            };
+            clientAccounts[loginid] = { loginid, token: trimmed, currency: currency ?? 'USD' };
 
-            // Also add any additional accounts from account_list if present
-            if (Array.isArray(authorize.account_list)) {
-                authorize.account_list.forEach((acc: { loginid: string; token?: string; currency?: string }) => {
-                    if (acc.loginid !== loginid && acc.token) {
+            // All additional accounts from account_list (each carries its own token)
+            if (Array.isArray(account_list)) {
+                account_list.forEach((acc: AuthorizeAccount) => {
+                    if (acc.loginid && acc.loginid !== loginid && acc.token) {
                         accountsList[acc.loginid] = acc.token;
                         clientAccounts[acc.loginid] = {
                             loginid: acc.loginid,
@@ -115,42 +172,36 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
                 });
             }
 
-            // Write to localStorage — same keys as OAuth/AuthWrapper
+            // Persist — same keys read by V2GetActiveToken, V2GetActiveClientId,
+            // getDefaultServerURL, and CoreStoreProvider
             localStorage.setItem('accountsList', JSON.stringify(accountsList));
             localStorage.setItem('clientAccounts', JSON.stringify(clientAccounts));
             localStorage.setItem('authToken', trimmed);
             localStorage.setItem('active_loginid', loginid);
+            if (country) localStorage.setItem('client.country', country);
+
+            // Force the server URL so getSocketURL() returns the right server
+            // immediately on reload (before active_loginid is re-read)
+            localStorage.setItem('config.server_url', targetServer);
+
+            safeDisconnect(api2);
+            api2 = null;
 
             setState('success');
 
-            // Disconnect the validation socket (app will create its own)
-            try {
-                (api as any).disconnect();
-            } catch (_) {
-                // ignore
-            }
+            // Reload — AuthWrapper reads localStorage and runs full auth flow
+            setTimeout(() => window.location.reload(), 800);
 
-            // Short delay so user sees the success state, then reload to trigger full auth
-            setTimeout(() => {
-                window.location.reload();
-            }, 800);
         } catch (err: unknown) {
+            safeDisconnect(api1);
+            safeDisconnect(api2);
             const msg = err instanceof Error ? err.message : String(err);
-            if (msg.includes('timeout') || msg.includes('Connection')) {
-                setErrorMessage(
-                    localize('Could not connect to Deriv servers. Please check your internet connection.')
-                );
+            if (msg.includes('timeout') || msg.includes('Connection') || msg.includes('WebSocket')) {
+                setErrorMessage(localize('Could not connect to Deriv servers. Please check your internet connection.'));
             } else {
                 setErrorMessage(localize('An unexpected error occurred. Please try again.'));
             }
             setState('error');
-
-            // Clean up socket on error
-            try {
-                (api as any)?.disconnect?.();
-            } catch (_) {
-                // ignore
-            }
         }
     }, [token, localize]);
 
