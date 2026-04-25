@@ -1,46 +1,10 @@
 import React, { useCallback, useState } from 'react';
-import { getAppId } from '@/components/shared';
-import { getInitialLanguage } from '@deriv-com/translations';
-import DerivAPIBasic from '@deriv/deriv-api/dist/DerivAPIBasic';
+import { generateDerivApiInstance } from '@/external/bot-skeleton/services/api/appId';
 import { LegacyClose1pxIcon } from '@deriv/quill-icons/Legacy';
 import { Localize, useTranslations } from '@deriv-com/translations';
 import './api-token-login-modal.scss';
 
-// ─── helpers ────────────────────────────────────────────────────────────────
-
-/** Is this loginid a demo/virtual account? */
-const isDemoLoginid = (loginid: string) => /^(VRT|VRW)/i.test(loginid);
-
-/**
- * Open a DerivAPIBasic socket to a specific server and wait for it to be ready.
- * Returns the api instance. Rejects on timeout or socket error.
- */
-const openSocket = (server: string): Promise<InstanceType<typeof DerivAPIBasic>> => {
-    return new Promise((resolve, reject) => {
-        const appId = getAppId();
-        const lang = getInitialLanguage();
-        const url = `wss://${server}/websockets/v3?app_id=${appId}&l=${lang}&brand=deriv`;
-        const ws = new WebSocket(url);
-        const api = new DerivAPIBasic({ connection: ws });
-        const timeout = setTimeout(() => {
-            try { ws.close(); } catch (_) { /* ignore */ }
-            reject(new Error('Connection timeout'));
-        }, 12000);
-        ws.addEventListener('open', () => {
-            clearTimeout(timeout);
-            resolve(api);
-        });
-        ws.addEventListener('error', () => {
-            clearTimeout(timeout);
-            reject(new Error('WebSocket connection failed'));
-        });
-    });
-};
-
-/** Safely disconnect an api instance without throwing. */
-const safeDisconnect = (api: InstanceType<typeof DerivAPIBasic> | null) => {
-    try { (api as any)?.disconnect?.(); } catch (_) { /* ignore */ }
-};
+// ─── types ──────────────────────────────────────────────────────────────────
 
 type TApiTokenLoginModalProps = {
     is_open: boolean;
@@ -48,6 +12,88 @@ type TApiTokenLoginModalProps = {
 };
 
 type TLoginState = 'idle' | 'loading' | 'success' | 'error';
+
+type TAuthorizeAccount = {
+    loginid: string;
+    token?: string;
+    currency?: string;
+    is_virtual?: number;
+    landing_company_name?: string;
+};
+
+type TAuthorizeResult = {
+    loginid: string;
+    currency: string;
+    balance: number;
+    email: string;
+    country: string;
+    account_list: TAuthorizeAccount[];
+};
+
+type TAuthorizeResponse = {
+    authorize?: TAuthorizeResult;
+    error?: { message: string; code: string };
+};
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/** Returns true for VRT / VRW (demo) login IDs */
+const isDemo = (loginid: string) => /^(VRT|VRW)/i.test(loginid);
+
+/**
+ * Safely disconnect a DerivAPIBasic instance without throwing.
+ * We type it as `any` to avoid importing the class (only available at build time).
+ */
+const safeDisconnect = (api: any) => {
+    try { api?.disconnect?.(); } catch (_) { /* ignore */ }
+};
+
+/**
+ * Wait for a DerivAPIBasic connection to be open (readyState === 1).
+ * Resolves immediately if already open. Rejects after `timeoutMs`.
+ */
+const waitForOpen = (api: any, timeoutMs = 12000): Promise<void> =>
+    new Promise((resolve, reject) => {
+        if (api?.connection?.readyState === 1) { resolve(); return; }
+        const t = setTimeout(() => reject(new Error('Connection timeout')), timeoutMs);
+        api?.connection?.addEventListener('open', () => { clearTimeout(t); resolve(); });
+        api?.connection?.addEventListener('error', () => {
+            clearTimeout(t);
+            reject(new Error('WebSocket connection failed'));
+        });
+    });
+
+/**
+ * Authorise `token` using the given server URL.
+ *
+ * We temporarily pin `config.server_url` in localStorage before calling
+ * `generateDerivApiInstance()` so that `getSocketURL()` (inside appId.js)
+ * connects to the right server. We restore the previous value (or remove it)
+ * after the socket is created.
+ */
+const authorizeOnServer = async (token: string, serverUrl: string): Promise<TAuthorizeResponse> => {
+    // Save & override server URL
+    const prev = localStorage.getItem('config.server_url');
+    localStorage.setItem('config.server_url', serverUrl);
+
+    let api: any = null;
+    try {
+        api = generateDerivApiInstance();
+        await waitForOpen(api);
+        const result = await api.authorize(token) as TAuthorizeResponse;
+        return result;
+    } finally {
+        // Always restore the previous server URL
+        if (prev === null) {
+            localStorage.removeItem('config.server_url');
+        } else {
+            localStorage.setItem('config.server_url', prev);
+        }
+        safeDisconnect(api);
+    }
+};
+
+// ─── component ───────────────────────────────────────────────────────────────
 
 const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
     const [token, setToken] = useState('');
@@ -77,90 +123,56 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
         setState('loading');
         setErrorMessage('');
 
-        // Phase-1 api (blue/demo server — safe neutral entry point)
-        let api1: InstanceType<typeof DerivAPIBasic> | null = null;
-        // Phase-2 api (correct server once we know real vs demo)
-        let api2: InstanceType<typeof DerivAPIBasic> | null = null;
-
-        type AuthorizeAccount = {
-            loginid: string;
-            token?: string;
-            currency?: string;
-            is_virtual?: number;
-            landing_company_name?: string;
-        };
-
-        type AuthorizeResponse = {
-            authorize: {
-                loginid: string;
-                currency: string;
-                balance: number;
-                email: string;
-                country: string;
-                account_list: AuthorizeAccount[];
-            };
-            error?: { message: string; code: string };
-        };
-
         try {
-            // ── Phase 1: connect to blue (neutral) to discover the loginid ───────
-            // blue.derivws.com serves both real and demo accounts for auth purposes.
-            // We need the loginid first to know which server to use for the app.
-            api1 = await openSocket('blue.derivws.com');
+            // ── Phase 1: probe on blue (neutral server) to get loginid ──────────
+            // blue.derivws.com accepts any valid token and returns the loginid
+            // without caring whether the account is real or demo.
+            const phase1 = await authorizeOnServer(trimmed, 'blue.derivws.com');
 
-            const phase1 = (await (api1 as any).authorize(trimmed)) as AuthorizeResponse;
-
-            if (phase1.error) {
+            if (phase1.error || !phase1.authorize) {
                 const e = phase1.error;
                 let msg = localize('Authentication failed. Please check your token and try again.');
-                if (e.code === 'InvalidToken') msg = localize('Invalid API token. Please make sure you copied it correctly.');
-                else if (e.code === 'DisabledClient') msg = localize('This account has been disabled. Please contact support.');
-                else if (e.message) msg = e.message;
+                if (e?.code === 'InvalidToken') {
+                    msg = localize('Invalid API token. Please make sure you copied it correctly.');
+                } else if (e?.code === 'DisabledClient') {
+                    msg = localize('This account has been disabled. Please contact support.');
+                } else if (e?.message) {
+                    msg = e.message;
+                }
                 setErrorMessage(msg);
                 setState('error');
-                safeDisconnect(api1);
                 return;
             }
 
             const { loginid, currency, country, account_list } = phase1.authorize;
-            const isDemo = isDemoLoginid(loginid);
+            const targetServer = isDemo(loginid) ? 'blue.derivws.com' : 'green.derivws.com';
 
-            // ── Phase 2: open the CORRECT server socket ───────────────────────────
-            // Real accounts must use green.derivws.com — this is what the app
-            // uses after login and what balance subscriptions run against.
-            // Demo accounts use blue.derivws.com.
-            // getDefaultServerURL() in config.ts does the same check.
-            safeDisconnect(api1);
-            api1 = null;
+            // ── Phase 2: re-authorize on the correct server ──────────────────────
+            // Real accounts must connect to green.derivws.com — that's where
+            // actual balances and trade execution live. This is exactly what
+            // getDefaultServerURL() in config.ts does after a normal OAuth login.
+            const phase2 = await authorizeOnServer(trimmed, targetServer);
 
-            const targetServer = isDemo ? 'blue.derivws.com' : 'green.derivws.com';
-            api2 = await openSocket(targetServer);
-
-            const phase2 = (await (api2 as any).authorize(trimmed)) as AuthorizeResponse;
-
-            if (phase2.error) {
+            if (phase2.error || !phase2.authorize) {
                 const e = phase2.error;
                 let msg = localize('Authentication failed. Please try again.');
-                if (e.message) msg = e.message;
+                if (e?.message) msg = e.message;
                 setErrorMessage(msg);
                 setState('error');
-                safeDisconnect(api2);
                 return;
             }
 
-            // ── Build localStorage structures ──────────────────────────────────
-            // Must exactly mirror what AuthWrapper.setLocalStorageToken() writes
-            // so that api-base.ts → authorizeAndSubscribe() picks everything up.
+            // ── Build localStorage — mirrors AuthWrapper.setLocalStorageToken ────
             const accountsList: Record<string, string> = {};
             const clientAccounts: Record<string, { loginid: string; token: string; currency: string }> = {};
 
-            // Primary account — always use the provided token
+            // Primary account — always mapped to the supplied token
             accountsList[loginid] = trimmed;
             clientAccounts[loginid] = { loginid, token: trimmed, currency: currency ?? 'USD' };
 
-            // All additional accounts from account_list (each carries its own token)
+            // Additional accounts (carry their own tokens in account_list)
             if (Array.isArray(account_list)) {
-                account_list.forEach((acc: AuthorizeAccount) => {
+                account_list.forEach(acc => {
                     if (acc.loginid && acc.loginid !== loginid && acc.token) {
                         accountsList[acc.loginid] = acc.token;
                         clientAccounts[acc.loginid] = {
@@ -172,32 +184,27 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
                 });
             }
 
-            // Persist — same keys read by V2GetActiveToken, V2GetActiveClientId,
-            // getDefaultServerURL, and CoreStoreProvider
-            localStorage.setItem('accountsList', JSON.stringify(accountsList));
+            // Write all keys — same ones read by V2GetActiveToken, V2GetActiveClientId,
+            // getDefaultServerURL, and CoreStoreProvider on app boot
+            localStorage.setItem('accountsList',   JSON.stringify(accountsList));
             localStorage.setItem('clientAccounts', JSON.stringify(clientAccounts));
-            localStorage.setItem('authToken', trimmed);
+            localStorage.setItem('authToken',      trimmed);
             localStorage.setItem('active_loginid', loginid);
-            if (country) localStorage.setItem('client.country', country);
-
-            // Force the server URL so getSocketURL() returns the right server
-            // immediately on reload (before active_loginid is re-read)
+            // Pin the server so getSocketURL() uses it immediately on reload
             localStorage.setItem('config.server_url', targetServer);
-
-            safeDisconnect(api2);
-            api2 = null;
+            if (country) localStorage.setItem('client.country', country);
 
             setState('success');
 
-            // Reload — AuthWrapper reads localStorage and runs full auth flow
+            // Reload — AuthWrapper picks up localStorage and runs the full auth flow
             setTimeout(() => window.location.reload(), 800);
 
         } catch (err: unknown) {
-            safeDisconnect(api1);
-            safeDisconnect(api2);
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes('timeout') || msg.includes('Connection') || msg.includes('WebSocket')) {
-                setErrorMessage(localize('Could not connect to Deriv servers. Please check your internet connection.'));
+                setErrorMessage(
+                    localize('Could not connect to Deriv servers. Please check your internet connection.')
+                );
             } else {
                 setErrorMessage(localize('An unexpected error occurred. Please try again.'));
             }
@@ -207,9 +214,7 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
 
     const handleKeyDown = useCallback(
         (e: React.KeyboardEvent<HTMLInputElement>) => {
-            if (e.key === 'Enter' && state !== 'loading') {
-                handleLogin();
-            }
+            if (e.key === 'Enter' && state !== 'loading') handleLogin();
         },
         [handleLogin, state]
     );
@@ -218,11 +223,8 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
 
     return (
         <div className='api-token-modal__overlay' onClick={handleClose} role='dialog' aria-modal='true'>
-            <div
-                className='api-token-modal__container'
-                onClick={e => e.stopPropagation()}
-                role='document'
-            >
+            <div className='api-token-modal__container' onClick={e => e.stopPropagation()} role='document'>
+
                 {/* Header */}
                 <div className='api-token-modal__header'>
                     <h2 className='api-token-modal__title'>
@@ -241,7 +243,7 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
                 {/* Body */}
                 <div className='api-token-modal__body'>
                     <p className='api-token-modal__description'>
-                        <Localize i18n_default_text='Enter your Deriv API token to log in directly. Make sure your token has the Read and Trade permissions enabled.' />
+                        <Localize i18n_default_text='Enter your Deriv API token to log in directly. Make sure your token has Read and Trade permissions enabled.' />
                     </p>
 
                     <div className='api-token-modal__field'>
@@ -250,20 +252,18 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
                         </label>
                         <input
                             id='api-token-input'
-                            className={`api-token-modal__input ${error_message ? 'api-token-modal__input--error' : ''}`}
+                            className={`api-token-modal__input${error_message ? ' api-token-modal__input--error' : ''}`}
                             type='password'
                             value={token}
                             onChange={e => {
                                 setToken(e.target.value);
-                                if (state === 'error') {
-                                    setState('idle');
-                                    setErrorMessage('');
-                                }
+                                if (state === 'error') { setState('idle'); setErrorMessage(''); }
                             }}
                             onKeyDown={handleKeyDown}
                             placeholder={localize('Paste your API token here')}
                             disabled={state === 'loading' || state === 'success'}
                             autoComplete='off'
+                            // eslint-disable-next-line jsx-a11y/no-autofocus
                             autoFocus
                         />
                         {error_message && (
@@ -280,9 +280,7 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
                     )}
 
                     <div className='api-token-modal__help'>
-                        <Localize
-                            i18n_default_text="Don't have an API token? "
-                        />
+                        <Localize i18n_default_text="Don't have an API token? " />
                         <a
                             href='https://app.deriv.com/account/api-token'
                             target='_blank'
@@ -305,7 +303,7 @@ const ApiTokenLoginModal = ({ is_open, onClose }: TApiTokenLoginModalProps) => {
                         <Localize i18n_default_text='Cancel' />
                     </button>
                     <button
-                        className={`api-token-modal__btn api-token-modal__btn--primary ${state === 'loading' ? 'api-token-modal__btn--loading' : ''}`}
+                        className={`api-token-modal__btn api-token-modal__btn--primary${state === 'loading' ? ' api-token-modal__btn--loading' : ''}`}
                         onClick={handleLogin}
                         type='button'
                         disabled={state === 'loading' || state === 'success' || !token.trim()}
