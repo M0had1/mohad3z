@@ -275,11 +275,31 @@
 
 .auth-actions {
     display: flex;
+    align-items: center;
     padding-block: 8px;
+    gap: 0.8rem;
 
     button {
         font-weight: 400;
-        margin-inline-end: 1.6rem;
+        margin-inline-end: 0;
+    }
+
+    .api-token-login-btn {
+        border: 1.5px solid var(--button-secondary-default);
+        background: transparent;
+        color: var(--text-prominent);
+        font-size: 1.2rem;
+        padding: 0.8rem 1.4rem;
+        border-radius: 0.6rem;
+        white-space: nowrap;
+
+        &:hover {
+            background: var(--general-hover);
+        }
+
+        span {
+            color: var(--text-prominent) !important;
+        }
     }
 }
 

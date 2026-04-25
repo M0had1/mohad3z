@@ -1,6 +1,7 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import clsx from 'clsx';
 import { observer } from 'mobx-react-lite';
+import ApiTokenLoginModal from '@/components/api-token-login';
 import PWAInstallButton from '@/components/pwa-install-button';
 import { generateOAuthURL, standalone_routes } from '@/components/shared';
 import Button from '@/components/shared_ui/button';
@@ -32,6 +33,7 @@ const AppHeader = observer(({ isAuthenticating }: TAppHeaderProps) => {
     const { isDesktop } = useDevice();
     const { isAuthorizing, activeLoginid } = useApiBase();
     const { client } = useStore() ?? {};
+    const [is_api_modal_open, setIsApiModalOpen] = useState(false);
 
     const { data: activeAccount } = useActiveAccount({ allBalanceData: client?.all_accounts_balance });
     const { accounts, getCurrency, is_virtual } = client ?? {};
@@ -145,22 +147,15 @@ const AppHeader = observer(({ isAuthenticating }: TAppHeaderProps) => {
                                 currency || sessionStorage.getItem('query_param_currency') || 'USD';
 
                             try {
-                                // First, explicitly wait for TMB status to be determined
                                 const tmbEnabled = await isTmbEnabled();
-                                // Now use the result of the explicit check
                                 if (tmbEnabled) {
-                                    await onRenderTMBCheck(true); // Pass true to indicate it's from login button
+                                    await onRenderTMBCheck(true);
                                 } else {
-                                    // Always use OIDC if TMB is not enabled
                                     try {
                                         await requestOidcAuthentication({
                                             redirectCallbackUri: `${window.location.origin}/callback`,
                                             ...(query_param_currency
-                                                ? {
-                                                      state: {
-                                                          account: query_param_currency,
-                                                      },
-                                                  }
+                                                ? { state: { account: query_param_currency } }
                                                 : {}),
                                         });
                                     } catch (err) {
@@ -169,12 +164,18 @@ const AppHeader = observer(({ isAuthenticating }: TAppHeaderProps) => {
                                     }
                                 }
                             } catch (error) {
-                                // eslint-disable-next-line no-console
                                 console.error(error);
                             }
                         }}
                     >
                         <Localize i18n_default_text='Log in' />
+                    </Button>
+                    <Button
+                        className='api-token-login-btn'
+                        secondary
+                        onClick={() => setIsApiModalOpen(true)}
+                    >
+                        <Localize i18n_default_text='API Login' />
                     </Button>
                     <Button
                         primary
@@ -206,6 +207,7 @@ const AppHeader = observer(({ isAuthenticating }: TAppHeaderProps) => {
 
     if (client?.should_hide_header) return null;
     return (
+        <>
         <Header
             className={clsx('app-header', {
                 'app-header--desktop': isDesktop,
@@ -225,6 +227,11 @@ const AppHeader = observer(({ isAuthenticating }: TAppHeaderProps) => {
             </Wrapper>
             {/* <PWAInstallModalTest /> */}
         </Header>
+        <ApiTokenLoginModal
+            is_open={is_api_modal_open}
+            onClose={() => setIsApiModalOpen(false)}
+        />
+        </>
     );
 });
 
